@@ -1,0 +1,731 @@
+local replicatedstorage = game:GetService("ReplicatedStorage")
+local soundserv = game:GetService("SoundService")
+local uis = game:GetService("UserInputService")
+local runserv = game:GetService("RunService")
+local debris = game:GetService("Debris")
+
+local player = game.Players.LocalPlayer
+
+local ViewModels = replicatedstorage.ViewModels
+local camera = workspace.CurrentCamera
+local weapon_sfx = soundserv:WaitForChild('Weapon_sfx')
+local soundeffects = replicatedstorage:WaitForChild('SoundEffects')
+
+local ServerUpdates = replicatedstorage:WaitForChild('ServerUpdates')
+
+--// FOLDERS \\----
+
+local PlayersFolders = workspace:WaitForChild('PlayersFolders')
+
+local RaycastsFolder = PlayersFolders:WaitForChild('Raycasts')
+
+---// VALUES \\--------------------------------------------------
+
+local Toolequipped = nil
+local PreviousTool = nil
+
+local GetRayDirection = false
+
+--// CONNECTIONS \\-------------------------
+
+local ViewModelConnection
+local uisConnection
+
+-- WEAPONS
+
+local GravityGunRaycasterConnection
+local GravityGunPhysicsConnection
+local AR2FiringConnection
+local RocketPropellerConnection -- MOVES THE ROCKET
+local RocketCollisionConnection -- WHEN ROCKET TOUCHES SOMETHING
+local ZoomCameraOnMouseMoveConnection -- ZOOMS CAMERA WHEN HOLDING MOUSE
+
+----------------------------------------------
+
+
+
+local RAYLENGTH
+
+---// TABLES \\----------------------------
+
+local Connections = {}
+
+local RaycastExclude = {}
+
+
+local module = {}
+
+
+
+local function CreateViewModel(Tool)
+	if Toolequipped ~= nil then
+		if camera:FindFirstChild(PreviousTool) then
+			camera:FindFirstChild(PreviousTool):Destroy()
+		end
+	end
+	Toolequipped = Tool
+	
+	ViewModels.Client:FindFirstChild(Tool):clone().Parent = camera
+	
+	warn(ViewModels.Client:FindFirstChild(Tool).Parent)
+	ViewModelConnection = runserv.RenderStepped:Connect(function()
+		if player.Character.Humanoid.Health <= 0 then
+			if camera:FindFirstChild(Tool) == nil then
+				camera:FindFirstChild(Tool):Destroy()
+				ViewModelConnection:Disconnect()
+			else
+				camera:FindFirstChild(Tool):Destroy()
+				ViewModelConnection:Disconnect()
+			end
+		end
+		if Toolequipped then
+			if camera:FindFirstChild(Tool) ~= nil then
+				camera:FindFirstChild(Tool):SetPrimaryPartCFrame(camera.CFrame)
+				for i,v in pairs(camera:FindFirstChild(Tool):GetChildren()) do
+					if v:IsA('BasePart') then
+						v.CanCollide = false
+					end
+				end
+				camera:FindFirstChild(Tool):SetPrimaryPartCFrame(camera.CFrame)
+				PreviousTool = Tool
+			end
+		end
+	end)
+	table.insert(Connections,ViewModelConnection)
+end
+
+local function VisualizeRay(Origin,Direction,rayresult)
+	print('VISUALIZING RAY')
+	local endpoint
+	
+	if rayresult then
+		endpoint = rayresult.Position
+	else
+		endpoint = Origin + Direction
+	end
+	local length = (endpoint - Origin).Magnitude
+	local midpoint = Origin + (endpoint - Origin) * .5
+	
+	local p = Instance.new('Part')
+	p.Anchored = true
+	p.CanCollide = false
+	p.Material = Enum.Material.Neon
+	p.Name = 'Raycast'
+	p.Color = Color3.fromRGB(255, 0, 0)
+	p.Size = Vector3.new(.1,.1,length)
+	p.CFrame = CFrame.new(midpoint,Origin + Direction)
+	
+	p.Parent = workspace.PlayersFolders.Raycasts:FindFirstChild(player.Name..'Raycasts')
+	
+	task.wait()
+	p:Destroy()
+end
+
+local function CreateRaycast(RAYLENGTH,GetRayDirection,DoNotVisualize)
+	local mouse = player:GetMouse()
+	local cameraPos = camera.CFrame.Position
+	local unitRay = (mouse.Hit.Position - cameraPos).Unit
+	
+	if GetRayDirection then
+		return unitRay
+	end
+	local raycastparams = RaycastParams.new()
+	raycastparams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastparams.FilterDescendantsInstances = {player.Character}
+	
+	local raycast = workspace:Raycast(cameraPos,unitRay * RAYLENGTH,raycastparams)
+	
+	if DoNotVisualize then
+		print('not visualized')
+	else
+		VisualizeRay(cameraPos,unitRay * RAYLENGTH)
+	end
+	
+	return raycast
+end
+
+local function DetectMaterialSurface(Asset)
+	if Asset:HasTag('Hit_metal') then
+		weapon_sfx.Crowbar.Hit_Metal_sfx:Play()
+	elseif Asset:HasTag('Hit_wood') then
+		weapon_sfx.Crowbar.Hit_Wood_sfx:Play()
+	elseif Asset:HasTag('Hit_rubber') then
+		weapon_sfx.Crowbar.Hit_Rubber_sfx:Play()
+	elseif Asset:HasTag('Hit_fragile') then
+		weapon_sfx.Crowbar.Hit_Fragile_sfx:Play()
+	elseif Asset:HasTag('Hit_metals') then
+		weapon_sfx.Crowbar.Hit_Metals_sfx:Play()
+	end
+end
+
+
+--------------// GUN FUNCTIONS \\----------------------------------------------------
+
+-- ROCKET LAUNCHER
+
+local function StopRocketPropeller()
+	if RocketPropellerConnection then
+		RocketPropellerConnection:Disconnect()
+		RocketPropellerConnection = nil
+		print('DISCONNECTED')
+	end
+end
+
+local function DeleteProjectile(Rocket)
+	if Rocket then
+		Rocket:Destroy()
+		print('DESTROYED ROCKET')
+	end 
+end
+
+local function CreateExplosion(Rocket)
+	local explosion = Instance.new('Explosion')
+	explosion.BlastRadius = 30
+	explosion.Position = Rocket.Position
+	explosion.Parent = PlayersFolders.Projectiles:FindFirstChild(player.Name..'Projectiles')
+	
+	local explosionanchor = Instance.new('Part')
+	explosionanchor.Transparency = 1
+	explosionanchor.Anchored = true
+	explosionanchor.Position = explosion.Position
+	explosionanchor.Parent = explosion
+	
+	local explosion_sfx = soundeffects.Weapons_sfx.RocketExplosion_sfx:Clone()
+	explosion_sfx.Parent = explosionanchor
+	explosion_sfx:Play()
+end
+
+local function PropelRocket(RocketPP,Rocket,RayDirection)
+	local Explosive = false
+	local attachment = Instance.new('Attachment')
+	attachment.Parent = RocketPP
+	
+	local velocity = Instance.new('LinearVelocity')
+	velocity.MaxForce = 10000
+	velocity.Attachment0 = attachment
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	
+	velocity.VectorVelocity = RayDirection * 10 --SPEED
+	velocity.Parent = RocketPP
+
+	local angularvelocity = Instance.new('AngularVelocity')
+	angularvelocity.MaxTorque = 10000
+	angularvelocity.AngularVelocity = Vector3.new(0,0,0)
+	angularvelocity.Attachment0 = attachment
+	angularvelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	angularvelocity.Parent = RocketPP
+	
+	RocketPP.Touched:Connect(function(hit)
+		if Explosive and hit.Name ~= 'Rocket_Projectile' then
+			CreateExplosion(RocketPP)
+			StopRocketPropeller()
+			DeleteProjectile(Rocket)
+			return
+		end
+	end)
+	task.delay(.05,function() --// ENABLE ROCKET TO EXPLODE
+		Explosive = true
+		
+		task.delay(2,function() --------// ROCKET DESPAWN TIME
+			StopRocketPropeller()
+			DeleteProjectile(Rocket)
+		end)
+	end)
+end
+
+
+local function CreateRocket(Tool,direction)
+	
+	local rocket_projectile = replicatedstorage.ClonableModels.Rocket_Projectile
+	local PlayerProjectilesFolder = PlayersFolders.Projectiles:FindFirstChild(player.Name..'Projectiles')
+	
+	local Tool_ExP = camera:FindFirstChild(Tool)
+	if Tool_ExP then
+		local origin = Tool_ExP.RPG_model.ammo.ammo1.Position
+
+		local rocket = rocket_projectile:Clone()
+
+		local lookscframe = CFrame.new(origin,origin + direction)
+		local rotationOffset = CFrame.Angles(0,math.rad(-90),0)
+		rocket:PivotTo(lookscframe * rotationOffset)
+
+		rocket.Parent = PlayerProjectilesFolder
+		local rocketPP = PlayerProjectilesFolder.Rocket_Projectile.ammo1
+
+		PropelRocket(rocketPP,rocket,direction)
+	end
+end
+
+local function CreateRocketRaycast(Tool)
+	local mouse = player:GetMouse()
+	local origin = camera.CFrame.Position
+	local direction = (mouse.hit.Position - origin).Unit
+	
+	local rayparams = RaycastParams.new()
+	rayparams.FilterType = Enum.RaycastFilterType.Exclude
+	rayparams.FilterDescendantsInstances = {player.Character}
+	
+	local Raylength = direction * 1000
+	
+	local raycast = workspace:Raycast(origin,Raylength,rayparams)
+	if raycast then
+		CreateRocket(Tool,Raylength)
+	else
+		CreateRocket(Tool,Raylength)
+	end
+end
+
+--- AR2
+
+local function CreateGunFire(ParticleEmitter,TurnOff)
+	if TurnOff then
+		ParticleEmitter.Enabled = false
+	else
+		ParticleEmitter.Enabled = true
+	end
+end
+
+local function CreateAR2Raycast(Tool,HoldingMouse,AbleToShoot,FireParticle)
+	
+	local ViewModel = camera:FindFirstChild(Tool)
+	if ViewModel then
+		weapon_sfx.AR2.GunShot_sfx:Play()
+		local AR2GunFireEmitter = ViewModel.AR2_model.GunTip.GunFireEmitter
+		local ParticleEmitter = AR2GunFireEmitter.ParticleEmitter
+
+		AR2FiringConnection = runserv.Heartbeat:Connect(function()
+			if HoldingMouse and AbleToShoot then
+
+				CreateGunFire(ParticleEmitter)
+				local raycast = CreateRaycast(RAYLENGTH,false,true)
+
+				if raycast then
+					local Targethum = raycast.Instance.Parent:FindFirstChild('Humanoid')	
+					local AR2_VM = camera:FindFirstChild(Tool)
+
+					if Targethum then
+						Targethum:TakeDamage(10)
+					end
+				end
+				AbleToShoot = false
+				task.delay(.1,function()
+					AbleToShoot = true
+				end)
+			end
+		end)
+	end
+end
+
+
+-------------// GRAVITY GUN FUNCTIONS \\-----------------------------------------
+
+
+--local function CreateGravityGunRaycast(GravityGun)
+--	local ViewModel = camera:FindFirstChild(GravityGun)
+--	local Origin = ViewModel.PhysicsGun_model.BlueEnergy.RayOrigin.Position
+	
+--	local unitRay = (mouse.Hit.Position - Origin).Unit
+	
+--	local PlayerRaysFolder = RaycastsFolder:FindFirstChild(player.Name..'RayCasts')
+	
+--	local raycastparams = RaycastParams.new()
+--	raycastparams.FilterType = Enum.RaycastFilterType.Exclude
+--	raycastparams.FilterDescendantsInstances = {player.Character}
+
+--	local raycast = workspace:Raycast(Origin,unitRay * RAYLENGTH,raycastparams)
+	
+--	VisualizeRay(Origin,unitRay * RAYLENGTH)
+
+--	return raycast
+--end
+
+function module.CreateGravityGunRaycast(GravityGun,mouseHitPos)
+	local ViewModel = camera:FindFirstChild(GravityGun)
+	
+	if ViewModel then
+		local Origin = ViewModel.PhysicsGun_model.BlueEnergy.RayOrigin.Position
+		local unitRay = (mouseHitPos - Origin).Unit
+
+		local PlayerRaysFolder = RaycastsFolder:FindFirstChild(player.Name..'RayCasts')
+
+		local raycastparams = RaycastParams.new()
+		raycastparams.FilterType = Enum.RaycastFilterType.Exclude
+		raycastparams.FilterDescendantsInstances = {player.Character}
+
+		local raycast = workspace:Raycast(Origin,unitRay * RAYLENGTH,raycastparams)
+
+		VisualizeRay(Origin,unitRay * RAYLENGTH,raycast)
+
+		return raycast
+	end
+end
+
+local function DisableGravityGun()
+	if GravityGunPhysicsConnection then
+		GravityGunPhysicsConnection:Disconnect()
+		GravityGunPhysicsConnection = nil
+	end
+	if GravityGunRaycasterConnection then
+		GravityGunRaycasterConnection:Disconnect()
+		GravityGunRaycasterConnection = nil
+	end
+	
+end
+
+local function CalculateGravityGunMovement(Origin,mousePos,mouseHitPos,alignPos)
+	local HoldingDistance = 15
+	local TargetPos = Origin + mousePos * HoldingDistance
+
+	local dist = (mouseHitPos - Origin).Magnitude
+	if dist < HoldingDistance then
+		TargetPos = mouseHitPos
+	end
+
+	alignPos.Position = TargetPos
+end
+
+local function CalculateGravityGunLaser(Origin,distance,raycastparams,Asset,WhenGrabbed)
+	local Raycast = workspace:Raycast(Origin,distance,raycastparams)
+
+	local GrabWorldPosition = Asset.CFrame:PointToWorldSpace(WhenGrabbed)
+	local RayDirection = GrabWorldPosition - Origin
+
+	VisualizeRay(Origin,RayDirection)
+end
+
+local function EnableGravityGunPhysics(Asset,GravityGun,raycast)
+	DisableGravityGun()
+	
+	local Mouse = player:GetMouse()
+	Mouse.TargetFilter = Asset
+	
+	local WhenGrabbed = Asset.CFrame:PointToObjectSpace(raycast.Position)
+	
+	GravityGunPhysicsConnection = runserv.PreRender:Connect(function()
+		uis.InputBegan:Connect(function(input,gpe)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				Asset.Anchored = true
+				Asset.Velocity = Vector3.new(0,0,0)
+			end
+		end)
+		local attachment = Instance.new('Attachment')
+		attachment.Parent = Asset
+
+		local alignPos = Instance.new('AlignPosition')
+		alignPos.MaxForce = 100000
+		alignPos.Responsiveness = 200
+		alignPos.Mode = Enum.PositionAlignmentMode.OneAttachment
+		alignPos.Attachment0 = attachment
+		alignPos.Visible = true
+		alignPos.Parent = Asset
+		
+		local ViewModel = camera:FindFirstChild(GravityGun)
+		local Origin = ViewModel.PhysicsGun_model.BlueEnergy.RayOrigin.Position
+		local mouseHitPos = Mouse.Hit.Position
+
+		local distance = raycast.Position - Origin
+		local mousePos = (mouseHitPos - Origin).Unit
+
+		local raycastparams = RaycastParams.new()
+		raycastparams.FilterType = Enum.RaycastFilterType.Exclude
+		raycastparams.FilterDescendantsInstances = {player.Character}
+
+		CalculateGravityGunMovement(Origin,mousePos,mouseHitPos,alignPos)
+		CalculateGravityGunLaser(Origin,distance,raycastparams,Asset,WhenGrabbed)
+		attachment:Destroy()
+		alignPos:Destroy()
+	end)
+end
+
+----// TOOLGUN FUNCTIONS \\-------------------------------------
+
+function module._PassClipBoard(ClipBoard)
+	print(ClipBoard)
+end
+
+-------------------------------------------------------------------------------------
+
+local function Disconnect_Weapon_SFX()
+	for _,Sound in soundserv.Weapon_sfx:GetDescendants() do
+		if Sound:IsA('Sound') then
+			if Sound.Parent.Name == 'AR2' then
+				Sound:Stop()
+			end
+		end
+	end
+end
+
+local function Disconnect_FX()
+	Disconnect_Weapon_SFX()
+end
+
+local function WeaponActions(Tool,Clipboard)
+	local AbleToShoot = true
+	local HoldingMouse = false
+	
+	uisConnection = uis.InputBegan:Connect(function(input,gpe)
+		if gpe then return end
+		
+		if player.Character.Humanoid.Health > 0 then
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				RAYLENGTH = 100
+				if Tool == 'Crowbar_weapon' then     ---------// CROWBAR
+					RAYLENGTH = 8
+					local raycast = CreateRaycast(RAYLENGTH)
+					weapon_sfx.Crowbar.CrowbarSwing_sfx:Play()
+
+					if raycast and raycast.Instance:HasTag('Asset') then
+						local Asset = raycast.Instance
+						DetectMaterialSurface(Asset)
+
+						local Attachment = Instance.new('Attachment')
+						Attachment.Parent = Asset
+						Attachment.WorldPosition = raycast.Position
+
+						local rayDirection = CreateRaycast(RAYLENGTH,true)
+
+						local VForce = Instance.new('VectorForce')
+						VForce.Force = rayDirection * 5000
+						VForce.Attachment0 = Attachment
+						VForce.RelativeTo = Enum.ActuatorRelativeTo.World
+						VForce.Enabled = true
+						VForce.Parent = Asset
+
+						task.spawn(function()
+							task.wait(.1)
+							VForce:Destroy()
+							Attachment:Destroy()
+						end)
+					end
+				elseif Tool == 'GravityGun_weapon' then  --// GRAVITY GUN
+					print('CLICK BEGAN')
+
+					GravityGunRaycasterConnection = runserv.RenderStepped:Connect(function()
+						local mouse = player:GetMouse()
+						local mousehit = mouse.Hit.Position
+						mouse.TargetFilter = PlayersFolders.Raycasts
+						local raycast = module.CreateGravityGunRaycast(Tool,mousehit)
+
+						if raycast then
+							
+							if raycast.Instance:HasTag('Asset') and not raycast.Instance:HasTag('NextBot') then
+								local Asset = raycast.Instance
+								Asset.Anchored = false
+								EnableGravityGunPhysics(Asset,Tool,raycast)
+							elseif raycast.Instance:IsA('BasePart') then
+								if raycast.Instance:IsDescendantOf(workspace.MAPS) then
+									print(raycast.Instance)
+									local NonAsset = raycast.Position
+									module.CreateGravityGunRaycast(Tool,mousehit,NonAsset)
+								end
+							end
+						end
+					end)
+				elseif Tool == 'AR2_weapon' then   --// AR2
+					HoldingMouse = true
+					CreateAR2Raycast(Tool,HoldingMouse,AbleToShoot)
+
+				elseif Tool == 'Revolver_weapon' then  -----------------// REVOLVER
+					local raycast = CreateRaycast(RAYLENGTH,false,true)
+
+					if raycast and AbleToShoot then
+						local Targethum = raycast.Instance.Parent:FindFirstChild('Humanoid')	
+						local RevolverVM = camera:FindFirstChild(Tool)
+						weapon_sfx.Revolver.GunShot_sfx:Play()
+						if RevolverVM then
+							local FireParticle = RevolverVM.Revolver_model.GunFireEmitter.GunFireParticle
+
+							if Targethum then
+								Targethum:TakeDamage(10)
+							end
+							FireParticle.Enabled = true
+							task.spawn(function()
+								task.wait(.3)
+								FireParticle.Enabled = false
+							end)
+							task.spawn(function()
+								AbleToShoot = false
+								task.wait(1)
+								AbleToShoot = true
+							end)
+						end
+					end
+				elseif Tool == 'Shotgun_weapon' then
+
+					local raycast = CreateRaycast(RAYLENGTH,false,true)
+					if raycast and AbleToShoot then
+						local Targethum = raycast.Instance.Parent:FindFirstChild('Humanoid')	
+
+						local ShootGunVM = camera:FindFirstChild(Tool)
+						weapon_sfx.ShootGun.GunFire_sfx:Play()
+						if ShootGunVM then
+							local FireParticle = ShootGunVM.Shootgun_model.UpperBarrel.GunFirePart.ParticleEmitter
+
+							local hrp = player.Character.HumanoidRootPart
+							local TargetDistance = (raycast.Position - hrp.Position).Magnitude
+
+							if Targethum and TargetDistance < 18 then
+								Targethum:TakeDamage(10)
+							end
+							FireParticle.Enabled = true
+							task.spawn(function()
+								task.wait(.15)
+								FireParticle.Enabled = false
+							end)
+							task.spawn(function()
+								AbleToShoot = false
+								task.wait(.5)
+								weapon_sfx.ShootGun.Reload_sfx:Play()
+								task.wait(1)
+								AbleToShoot = true
+							end)
+						end
+					end
+				elseif Tool == 'RocketLauncher_weapon' then	
+					if AbleToShoot then
+						weapon_sfx.RPG.RPGFire_sfx:Play()
+						CreateRocketRaycast(Tool)
+						task.spawn(function()
+							AbleToShoot = false
+							task.wait(2)
+							AbleToShoot = true
+						end)
+					end
+				elseif Tool == 'Camera_weapon' then
+
+				elseif Tool == 'Toolgun_weapon' then
+
+				end
+			end
+		end
+	end)
+	
+	--------// INPUT ENDED \\-------------------------------------------
+	
+	
+	uis.InputEnded:Connect(function(input,gpe)
+		if gpe then return end
+		
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			if Tool == 'GravityGun_weapon' then
+				DisableGravityGun()
+				
+			elseif Tool == 'AR2_weapon' then
+				local ViewModel = camera:FindFirstChild(Tool)
+				if ViewModel then
+					local AR2GunFireEmitter = ViewModel.AR2_model.GunTip.GunFireEmitter
+					local ParticleEmitter = AR2GunFireEmitter.ParticleEmitter
+					weapon_sfx.AR2.GunShot_sfx:stop()
+					HoldingMouse = false
+					CreateGunFire(ParticleEmitter,true)
+				end
+				if AR2FiringConnection then
+					AR2FiringConnection:Disconnect()
+					AR2FiringConnection = nil
+				end
+			end
+		end
+	end)
+	table.insert(Connections,uisConnection)
+end
+
+local function DisconnectConnections()
+	for i,Connection in ipairs(Connections) do
+		Connection:Disconnect()
+	end
+end
+
+function module.DisableTool()
+	if uisConnection then
+		uisConnection:Disconnect()
+	end
+end
+
+function module.EnableTool()
+	WeaponActions(Toolequipped)
+end
+
+function module.OnPlayerDeath()
+	Disconnect_FX()
+	
+end
+
+
+----------// WEAPONS \\---------------------------------
+
+
+function module.Crowbar(Tool)
+	print(Tool..' Equipped')
+	
+	DisconnectConnections()
+	
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.GravityGun(Tool)
+	print(Tool..' Equipped')
+	
+	DisconnectConnections()
+	
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.AR2(Tool,ToolNumber)
+	print(Tool..' Equipped')
+	
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.Revolver(Tool,ToolNumber)
+	print(Tool..' Equipped')
+	
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.Shotgun(Tool,ToolNumber)
+	print(Tool..' Equipped')
+	
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.RocketLauncher(Tool,ToolNumber)
+	print(Tool..' Equipped')
+
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.Camera(Tool,ToolNumber)
+	print(Tool..' Equipped')
+
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool)
+end
+
+function module.Toolgun(Tool,ToolNumber,Clipboard)
+	print(Tool..' Equipped')
+
+	DisconnectConnections()
+
+	CreateViewModel(Tool)
+	WeaponActions(Tool,Clipboard)
+end
+
+
+
+return module
